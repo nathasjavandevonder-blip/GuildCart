@@ -1,10 +1,10 @@
 import os
 import json
-import shutil
 import asyncio
 import logging
 import traceback
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import discord
 from discord.ext import commands, tasks
@@ -68,6 +68,12 @@ def utc_badge(cart_date: str):
         return "🟡 TOMORROW "
     return ""
 
+
+def paginate(items, page: int):
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    return items[start:end]
+
 # ================= DATABASE =================
 
 async def init_db():
@@ -81,7 +87,9 @@ async def init_db():
             guildmaster_role_id INTEGER,
             log_channel_id INTEGER,
             utc_channel_id INTEGER,
-            panel_message_id INTEGER
+            panel_message_id INTEGER,
+            backup_message_id INTEGER,
+            officer_message_id INTEGER
         )
         """)
 
@@ -98,6 +106,12 @@ async def init_db():
         )
         """)
 
+        for column in ("backup_message_id", "officer_message_id"):
+            try:
+                await db.execute(f"ALTER TABLE guild_settings ADD COLUMN {column} INTEGER")
+            except Exception:
+                pass
+
         await db.commit()
 
 
@@ -106,7 +120,8 @@ async def get_settings(guild_id: int):
         cursor = await db.execute(
             """
             SELECT guild_id, cart_channel_id, cart_role_id, officer_role_id,
-                   guildmaster_role_id, log_channel_id, utc_channel_id, panel_message_id
+                   guildmaster_role_id, log_channel_id, utc_channel_id,
+                   panel_message_id, backup_message_id, officer_message_id
             FROM guild_settings
             WHERE guild_id=?
             """,
@@ -119,7 +134,8 @@ async def get_settings(guild_id: int):
 
     keys = [
         "guild_id", "cart_channel_id", "cart_role_id", "officer_role_id",
-        "guildmaster_role_id", "log_channel_id", "utc_channel_id", "panel_message_id"
+        "guildmaster_role_id", "log_channel_id", "utc_channel_id",
+        "panel_message_id", "backup_message_id", "officer_message_id"
     ]
     return dict(zip(keys, row))
 
@@ -151,10 +167,13 @@ async def save_settings(guild_id: int, cart_channel_id: int, cart_role_id: int,
         await db.commit()
 
 
-async def update_panel_message_id(guild_id: int, message_id: int):
+async def update_message_id(guild_id: int, column: str, message_id: int):
+    if column not in {"panel_message_id", "backup_message_id", "officer_message_id"}:
+        raise ValueError("Invalid message id column")
+
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "UPDATE guild_settings SET panel_message_id=? WHERE guild_id=?",
+            f"UPDATE guild_settings SET {column}=? WHERE guild_id=?",
             (message_id, guild_id)
         )
         await db.commit()
@@ -198,14 +217,47 @@ async def compress_queue(guild_id: int):
             )
         await db.commit()
 
+
+async def move_member(guild_id: int, user_id: int, direction: str):
+    rows = await get_queue(guild_id)
+    ids = [row[0] for row in rows]
+
+    if user_id not in ids:
+        return False
+
+    index = ids.index(user_id)
+
+    if direction == "up":
+        if index == 0:
+            return False
+        new_index = index - 1
+    elif direction == "down":
+        if index == len(ids) - 1:
+            return False
+        new_index = index + 1
+    else:
+        return False
+
+    ids[index], ids[new_index] = ids[new_index], ids[index]
+
+    async with aiosqlite.connect(DB) as db:
+        for pos, uid in enumerate(ids, start=1):
+            await db.execute(
+                "UPDATE carts SET position=? WHERE guild_id=? AND user_id=?",
+                (pos, guild_id, uid)
+            )
+        await db.commit()
+
+    return True
+
 # ================= PERMISSIONS / LOG =================
 
 def has_admin_access(member: discord.Member, settings: dict | None):
-    if not settings:
-        return member.guild_permissions.administrator
-
     if member.guild_permissions.administrator:
         return True
+
+    if not settings:
+        return False
 
     role_ids = {role.id for role in member.roles}
     return (
@@ -228,7 +280,85 @@ async def log_action(guild: discord.Guild, action: str):
     except Exception:
         traceback.print_exc()
 
-# ================= EMBED / PANEL =================
+# ================= BACKUPS =================
+
+def create_backup_folder():
+    Path(BACKUP_FOLDER).mkdir(parents=True, exist_ok=True)
+
+
+async def create_guild_backup(guild_id: int):
+    create_backup_folder()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_file = Path(BACKUP_FOLDER) / f"guild_{guild_id}_{timestamp}.json"
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            """
+            SELECT user_id, position, hour, cart_date, reminded, manual_name
+            FROM carts
+            WHERE guild_id=?
+            ORDER BY cart_date, hour, position
+            """,
+            (guild_id,)
+        )
+        rows = await cursor.fetchall()
+
+    data = {
+        "guild_id": guild_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "carts": [
+            {
+                "user_id": row[0],
+                "position": row[1],
+                "hour": row[2],
+                "cart_date": row[3],
+                "reminded": row[4],
+                "manual_name": row[5],
+            }
+            for row in rows
+        ]
+    }
+
+    backup_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return backup_file
+
+
+async def restore_latest_guild_backup(guild_id: int):
+    create_backup_folder()
+    files = sorted(Path(BACKUP_FOLDER).glob(f"guild_{guild_id}_*.json"), reverse=True)
+
+    if not files:
+        return None
+
+    latest = files[0]
+    data = json.loads(latest.read_text(encoding="utf-8"))
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM carts WHERE guild_id=?", (guild_id,))
+
+        for row in data.get("carts", []):
+            await db.execute(
+                """
+                INSERT INTO carts(guild_id, user_id, position, hour, cart_date, reminded, manual_name)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    guild_id,
+                    int(row["user_id"]),
+                    int(row["position"]),
+                    str(row["hour"]),
+                    str(row["cart_date"]),
+                    int(row.get("reminded") or 0),
+                    row.get("manual_name"),
+                )
+            )
+
+        await db.commit()
+
+    await compress_queue(guild_id)
+    return latest
+
+# ================= EMBED / PANELS =================
 
 async def build_queue_embed(guild: discord.Guild):
     rows = await get_queue(guild.id)
@@ -260,7 +390,31 @@ async def build_queue_embed(guild: discord.Guild):
     return embed
 
 
-async def refresh_panel(guild: discord.Guild):
+async def get_saved_message(channel: discord.TextChannel, message_id: int | None):
+    if not message_id:
+        return None
+    try:
+        return await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden):
+        return None
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+async def upsert_message(channel: discord.TextChannel, settings: dict, column: str, embed: discord.Embed, view: discord.ui.View):
+    message = await get_saved_message(channel, settings.get(column))
+
+    if message:
+        await message.edit(embed=embed, view=view)
+        return message
+
+    message = await channel.send(embed=embed, view=view)
+    await update_message_id(channel.guild.id, column, message.id)
+    return message
+
+
+async def refresh_queue_panel(guild: discord.Guild):
     settings = await get_settings(guild.id)
     if not settings or not settings.get("cart_channel_id"):
         return
@@ -269,25 +423,107 @@ async def refresh_panel(guild: discord.Guild):
     if not channel:
         return
 
-    embed = await build_queue_embed(guild)
-    view = CartView()
-    message = None
+    await upsert_message(
+        channel,
+        settings,
+        "panel_message_id",
+        await build_queue_embed(guild),
+        CartView(),
+    )
 
-    if settings.get("panel_message_id"):
-        try:
-            message = await channel.fetch_message(settings["panel_message_id"])
-        except discord.NotFound:
-            message = None
-        except discord.Forbidden:
-            message = None
 
-    if message:
-        await message.edit(embed=embed, view=view)
-    else:
-        message = await channel.send(embed=embed, view=view)
-        await update_panel_message_id(guild.id, message.id)
+async def refresh_backup_panel(guild: discord.Guild):
+    settings = await get_settings(guild.id)
+    if not settings or not settings.get("cart_channel_id"):
+        return
 
-# ================= VIEWS =================
+    channel = guild.get_channel(settings["cart_channel_id"])
+    if not channel:
+        return
+
+    embed = discord.Embed(
+        title="💾 Backup Panel",
+        description="💾 Backup this server queue\n♻️ Restore latest server backup",
+        colour=discord.Colour.blurple(),
+    )
+
+    await upsert_message(channel, settings, "backup_message_id", embed, BackupView())
+
+
+async def get_all_members(guild: discord.Guild):
+    result = []
+    seen_ids = set()
+
+    members = sorted(
+        [member for member in guild.members if not member.bot],
+        key=lambda member: member.display_name.lower()
+    )
+
+    for member in members:
+        result.append({"id": member.id, "name": f"👤 {member.display_name}"})
+        seen_ids.add(member.id)
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            """
+            SELECT user_id, manual_name
+            FROM carts
+            WHERE guild_id=?
+            ORDER BY cart_date, hour, position
+            """,
+            (guild.id,)
+        )
+        rows = await cursor.fetchall()
+
+    for uid, manual_name in rows:
+        if manual_name:
+            result.append({"id": uid, "name": f"📝 {manual_name}"})
+        elif uid not in seen_ids:
+            member = guild.get_member(uid)
+            if member:
+                result.append({"id": uid, "name": f"👤 {member.display_name}"})
+            else:
+                result.append({"id": uid, "name": f"👤 <@{uid}>"})
+            seen_ids.add(uid)
+
+    return result
+
+
+async def refresh_officer_panel(guild: discord.Guild):
+    settings = await get_settings(guild.id)
+    if not settings or not settings.get("cart_channel_id"):
+        return
+
+    channel = guild.get_channel(settings["cart_channel_id"])
+    if not channel:
+        return
+
+    members = await get_all_members(guild)
+
+    embed = discord.Embed(
+        title="⚜️ Officer Panel",
+        description=(
+            "Select one or more members.\n"
+            "Then choose Add, Remove, Move Up, Move Down, or Edit Date + Hour."
+        ),
+        colour=discord.Colour.red(),
+    )
+
+    await upsert_message(
+        channel,
+        settings,
+        "officer_message_id",
+        embed,
+        OfficerPanelView(members),
+    )
+
+
+async def refresh_all_panels(guild: discord.Guild):
+    await refresh_queue_panel(guild)
+    await refresh_backup_panel(guild)
+    await refresh_officer_panel(guild)
+
+# ================= USER VIEWS =================
 
 class JoinHourSelect(discord.ui.Select):
     def __init__(self):
@@ -326,7 +562,8 @@ class JoinHourSelect(discord.ui.Select):
             )
             await db.commit()
 
-        await refresh_panel(guild)
+        await refresh_queue_panel(guild)
+        await refresh_officer_panel(guild)
         await log_action(guild, f"{interaction.user.mention} joined the queue at `{cart_date} {hour} UTC`")
 
         await interaction.response.send_message(
@@ -360,7 +597,8 @@ class EditHourSelect(discord.ui.Select):
             )
             await db.commit()
 
-        await refresh_panel(guild)
+        await refresh_queue_panel(guild)
+        await refresh_officer_panel(guild)
         await log_action(guild, f"{interaction.user.mention} changed their cart hour to `{hour} UTC`")
         await interaction.response.send_message(f"✅ Hour changed to {hour} UTC.", ephemeral=True)
 
@@ -399,9 +637,317 @@ class CartView(discord.ui.View):
             await db.commit()
 
         await compress_queue(interaction.guild.id)
-        await refresh_panel(interaction.guild)
+        await refresh_queue_panel(interaction.guild)
+        await refresh_officer_panel(interaction.guild)
         await log_action(interaction.guild, f"{interaction.user.mention} left the queue")
         await interaction.response.send_message("❌ Removed from queue.", ephemeral=True)
+
+# ================= BACKUP VIEW =================
+
+class BackupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Backup Queue", emoji="💾", style=discord.ButtonStyle.green, custom_id="public_backup_queue")
+    async def backup_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_settings(interaction.guild.id)
+        if not has_admin_access(interaction.user, settings):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+
+        backup_file = await create_guild_backup(interaction.guild.id)
+        await log_action(interaction.guild, f"{interaction.user.mention} created backup `{backup_file.name}`")
+        await interaction.response.send_message(f"✅ Backup created: `{backup_file.name}`", ephemeral=True)
+
+    @discord.ui.button(label="Restore Backup", emoji="♻️", style=discord.ButtonStyle.blurple, custom_id="public_restore_backup")
+    async def restore_backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await get_settings(interaction.guild.id)
+        if not has_admin_access(interaction.user, settings):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+
+        await create_guild_backup(interaction.guild.id)
+        latest = await restore_latest_guild_backup(interaction.guild.id)
+
+        if not latest:
+            return await interaction.response.send_message("No backups found.", ephemeral=True)
+
+        await refresh_queue_panel(interaction.guild)
+        await refresh_officer_panel(interaction.guild)
+        await log_action(interaction.guild, f"{interaction.user.mention} restored backup `{latest.name}`")
+        await interaction.response.send_message(f"✅ Restored `{latest.name}`", ephemeral=True)
+
+# ================= OFFICER PANEL =================
+
+class MemberSelect(discord.ui.Select):
+    def __init__(self, members, page: int = 0):
+        self.members = members
+        self.page = page
+        page_members = paginate(members, page)
+
+        options = []
+        for member_data in page_members:
+            label = member_data.get("name", "Unknown")
+            value = str(member_data.get("id"))
+            options.append(discord.SelectOption(label=label[:100], value=value))
+
+        if not options:
+            options.append(discord.SelectOption(label="No members found", value="none"))
+
+        super().__init__(
+            placeholder=f"Select members (page {page + 1})",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            custom_id=f"public_member_select_page_{page}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            return await interaction.response.send_message("No members available.", ephemeral=True)
+
+        self.view.selected_members = [int(value) for value in self.values]
+
+        name_lookup = {int(item["id"]): item["name"] for item in self.view.members}
+        selected_names = [name_lookup.get(int(value), f"<@{value}>") for value in self.values]
+
+        await interaction.response.send_message("Selected: " + ", ".join(selected_names), ephemeral=True)
+
+
+class ManualAddModal(discord.ui.Modal, title="Add Name Manually"):
+    name = discord.ui.TextInput(label="Name", placeholder="Type the name here", required=True, max_length=50)
+    cart_date = discord.ui.TextInput(label="Date", placeholder="YYYY-MM-DD", required=True, max_length=10)
+    hour = discord.ui.TextInput(label="Hour UTC", placeholder="Example: 18:00", required=True, max_length=5)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        date_value = str(self.cart_date).strip()
+        hour_value = str(self.hour).strip()
+
+        if not valid_date(date_value):
+            return await interaction.response.send_message("Invalid date. Use YYYY-MM-DD.", ephemeral=True)
+        if not valid_hour(hour_value):
+            return await interaction.response.send_message("Invalid hour. Use format like 18:00.", ephemeral=True)
+
+        rows = await get_queue(interaction.guild.id)
+        position = len(rows) + 1
+        manual_id = -int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                """
+                INSERT INTO carts(guild_id, user_id, position, hour, cart_date, manual_name)
+                VALUES(?,?,?,?,?,?)
+                """,
+                (interaction.guild.id, manual_id, position, hour_value, date_value, str(self.name)[:50])
+            )
+            await db.commit()
+
+        await refresh_queue_panel(interaction.guild)
+        await refresh_officer_panel(interaction.guild)
+        await log_action(interaction.guild, f"{interaction.user.mention} added manual name `{self.name}` at `{date_value} {hour_value} UTC`")
+        await interaction.response.send_message(f"✅ Added `{self.name}` at {date_value} {hour_value} UTC.", ephemeral=True)
+
+
+class EditDateTimeModal(discord.ui.Modal, title="Edit Cart Date + Hour"):
+    new_date = discord.ui.TextInput(label="New date", placeholder="Example: 2026-07-01", required=True, max_length=10)
+    new_hour = discord.ui.TextInput(label="New hour UTC", placeholder="Example: 18:00", required=True, max_length=5)
+
+    def __init__(self, member_ids):
+        super().__init__()
+        self.member_ids = member_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        date_value = str(self.new_date).strip()
+        hour_value = str(self.new_hour).strip()
+
+        if not valid_date(date_value):
+            return await interaction.response.send_message("Invalid date. Use YYYY-MM-DD.", ephemeral=True)
+        if not valid_hour(hour_value):
+            return await interaction.response.send_message("Invalid hour. Use format like 18:00.", ephemeral=True)
+
+        updated = 0
+        async with aiosqlite.connect(DB) as db:
+            for member_id in self.member_ids:
+                cursor = await db.execute(
+                    "UPDATE carts SET cart_date=?, hour=?, reminded=0 WHERE guild_id=? AND user_id=?",
+                    (date_value, hour_value, interaction.guild.id, member_id)
+                )
+                updated += cursor.rowcount
+            await db.commit()
+
+        await refresh_queue_panel(interaction.guild)
+        await refresh_officer_panel(interaction.guild)
+        await log_action(interaction.guild, f"{interaction.user.mention} changed date/hour for {updated} member(s) to `{date_value} {hour_value} UTC`")
+        await interaction.response.send_message(f"✅ Updated {updated} member(s).", ephemeral=True)
+
+
+class AddMemberDateHourModal(discord.ui.Modal, title="Add Member Date/Hour"):
+    cart_date = discord.ui.TextInput(label="Date", placeholder="YYYY-MM-DD", required=True, max_length=10)
+    hour = discord.ui.TextInput(label="Hour UTC", placeholder="Example: 18:00", required=True, max_length=5)
+
+    def __init__(self, member_ids):
+        super().__init__()
+        self.member_ids = member_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        date_value = str(self.cart_date).strip()
+        hour_value = str(self.hour).strip()
+
+        if not valid_date(date_value):
+            return await interaction.response.send_message("Invalid date. Use YYYY-MM-DD.", ephemeral=True)
+        if not valid_hour(hour_value):
+            return await interaction.response.send_message("Invalid hour. Use format like 18:00.", ephemeral=True)
+
+        added = 0
+        rows = await get_queue(interaction.guild.id)
+        existing_ids = {row[0] for row in rows}
+        position = len(rows)
+
+        async with aiosqlite.connect(DB) as db:
+            for member_id in self.member_ids:
+                if member_id in existing_ids:
+                    continue
+                position += 1
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO carts(guild_id, user_id, position, hour, cart_date)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (interaction.guild.id, member_id, position, hour_value, date_value)
+                )
+                added += 1
+            await db.commit()
+
+        await compress_queue(interaction.guild.id)
+        await refresh_queue_panel(interaction.guild)
+        await refresh_officer_panel(interaction.guild)
+        await log_action(interaction.guild, f"{interaction.user.mention} added {added} member(s) at `{date_value} {hour_value} UTC`")
+        await interaction.response.send_message(f"✅ Added {added} member(s).", ephemeral=True)
+
+
+class ActionSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Add Member", value="add"),
+            discord.SelectOption(label="Add Name Manually", value="add_manual"),
+            discord.SelectOption(label="Remove Member", value="remove"),
+            discord.SelectOption(label="Move Up", value="up"),
+            discord.SelectOption(label="Move Down", value="down"),
+            discord.SelectOption(label="Edit Date + Hour", value="edit_datetime"),
+        ]
+        super().__init__(placeholder="Select action...", options=options, custom_id="public_action_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        action = self.values[0]
+
+        if action == "add_manual":
+            return await view.handle_action(interaction, action, [])
+
+        if not view.selected_members:
+            return await interaction.response.send_message("Select at least one member first.", ephemeral=True)
+
+        await view.handle_action(interaction, action, view.selected_members)
+
+
+class OfficerPanelView(discord.ui.View):
+    def __init__(self, members, page: int = 0):
+        super().__init__(timeout=None)
+        self.members = members
+        self.page = page
+        self.selected_members = []
+        self.refresh_ui()
+
+    def refresh_ui(self):
+        self.clear_items()
+        self.add_item(MemberSelect(self.members, self.page))
+        self.add_item(ActionSelect())
+        self.add_item(PrevButton(self))
+        self.add_item(NextButton(self))
+
+    async def handle_action(self, interaction: discord.Interaction, action: str, member_ids: list[int]):
+        settings = await get_settings(interaction.guild.id)
+        if not has_admin_access(interaction.user, settings):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+
+        if action == "add_manual":
+            return await interaction.response.send_modal(ManualAddModal())
+
+        if action == "edit_datetime":
+            return await interaction.response.send_modal(EditDateTimeModal(member_ids))
+
+        if action == "add":
+            return await interaction.response.send_modal(AddMemberDateHourModal(member_ids))
+
+        if action == "remove":
+            removed = 0
+            async with aiosqlite.connect(DB) as db:
+                for member_id in member_ids:
+                    cursor = await db.execute(
+                        "DELETE FROM carts WHERE guild_id=? AND user_id=?",
+                        (interaction.guild.id, member_id)
+                    )
+                    removed += cursor.rowcount
+                await db.commit()
+
+            await compress_queue(interaction.guild.id)
+            await refresh_queue_panel(interaction.guild)
+            await refresh_officer_panel(interaction.guild)
+            await log_action(interaction.guild, f"{interaction.user.mention} removed {removed} member(s) from the queue")
+            return await interaction.response.send_message(f"✅ Removed {removed} member(s).", ephemeral=True)
+
+        if action == "up":
+            moved = 0
+            for member_id in member_ids:
+                if await move_member(interaction.guild.id, member_id, "up"):
+                    moved += 1
+            await refresh_queue_panel(interaction.guild)
+            await refresh_officer_panel(interaction.guild)
+            await log_action(interaction.guild, f"{interaction.user.mention} moved {moved} member(s) up")
+            return await interaction.response.send_message(f"✅ Moved {moved} member(s) up.", ephemeral=True)
+
+        if action == "down":
+            moved = 0
+            for member_id in reversed(member_ids):
+                if await move_member(interaction.guild.id, member_id, "down"):
+                    moved += 1
+            await refresh_queue_panel(interaction.guild)
+            await refresh_officer_panel(interaction.guild)
+            await log_action(interaction.guild, f"{interaction.user.mention} moved {moved} member(s) down")
+            return await interaction.response.send_message(f"✅ Moved {moved} member(s) down.", ephemeral=True)
+
+
+class PrevButton(discord.ui.Button):
+    def __init__(self, panel):
+        super().__init__(label="⬅️ Prev", style=discord.ButtonStyle.gray, custom_id="public_officer_prev")
+        self.panel = panel
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_settings(interaction.guild.id)
+        if not has_admin_access(interaction.user, settings):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+
+        if self.panel.page > 0:
+            self.panel.page -= 1
+        self.panel.selected_members = []
+        self.panel.refresh_ui()
+        await interaction.response.edit_message(view=self.panel)
+
+
+class NextButton(discord.ui.Button):
+    def __init__(self, panel):
+        super().__init__(label="➡️ Next", style=discord.ButtonStyle.gray, custom_id="public_officer_next")
+        self.panel = panel
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_settings(interaction.guild.id)
+        if not has_admin_access(interaction.user, settings):
+            return await interaction.response.send_message("No permission.", ephemeral=True)
+
+        max_page = max((len(self.panel.members) - 1) // PAGE_SIZE, 0)
+        if self.panel.page < max_page:
+            self.panel.page += 1
+        self.panel.selected_members = []
+        self.panel.refresh_ui()
+        await interaction.response.edit_message(view=self.panel)
 
 # ================= COMMAND GROUP =================
 
@@ -430,13 +976,13 @@ async def setup_command(
     )
 
     await interaction.response.send_message(
-        "✅ Guild Cart bot setup saved. Posting/updating the panel now...",
+        "✅ Guild Cart bot setup saved. Posting/updating the panels now...",
         ephemeral=True
     )
-    await refresh_panel(interaction.guild)
+    await refresh_all_panels(interaction.guild)
 
 
-@cart.command(name="panel", description="Post or refresh the Guild Cart panel")
+@cart.command(name="panel", description="Post or refresh all Guild Cart panels")
 async def panel_command(interaction: discord.Interaction):
     settings = await get_settings(interaction.guild.id)
     if not has_admin_access(interaction.user, settings):
@@ -445,8 +991,8 @@ async def panel_command(interaction: discord.Interaction):
     if not settings:
         return await interaction.response.send_message("Run `/cart setup` first.", ephemeral=True)
 
-    await refresh_panel(interaction.guild)
-    await interaction.response.send_message("✅ Panel refreshed.", ephemeral=True)
+    await refresh_all_panels(interaction.guild)
+    await interaction.response.send_message("✅ Panels refreshed.", ephemeral=True)
 
 
 @cart.command(name="join", description="Join the cart queue")
@@ -471,7 +1017,8 @@ async def leave_command(interaction: discord.Interaction):
         await db.commit()
 
     await compress_queue(interaction.guild.id)
-    await refresh_panel(interaction.guild)
+    await refresh_queue_panel(interaction.guild)
+    await refresh_officer_panel(interaction.guild)
     await interaction.response.send_message("❌ Removed from queue.", ephemeral=True)
 
 
@@ -505,7 +1052,8 @@ async def officer_add_command(interaction: discord.Interaction, member: discord.
         await db.commit()
 
     await compress_queue(interaction.guild.id)
-    await refresh_panel(interaction.guild)
+    await refresh_queue_panel(interaction.guild)
+    await refresh_officer_panel(interaction.guild)
     await log_action(interaction.guild, f"{interaction.user.mention} added {member.mention} at `{date} {hour} UTC`")
     await interaction.response.send_message(f"✅ Added {member.mention} at {date} {hour} UTC.", ephemeral=True)
 
@@ -535,7 +1083,8 @@ async def manual_add_command(interaction: discord.Interaction, name: str, date: 
         )
         await db.commit()
 
-    await refresh_panel(interaction.guild)
+    await refresh_queue_panel(interaction.guild)
+    await refresh_officer_panel(interaction.guild)
     await log_action(interaction.guild, f"{interaction.user.mention} added manual name `{name}` at `{date} {hour} UTC`")
     await interaction.response.send_message(f"✅ Added `{name}` at {date} {hour} UTC.", ephemeral=True)
 
@@ -558,7 +1107,8 @@ async def officer_edit_command(interaction: discord.Interaction, member: discord
         )
         await db.commit()
 
-    await refresh_panel(interaction.guild)
+    await refresh_queue_panel(interaction.guild)
+    await refresh_officer_panel(interaction.guild)
     await log_action(interaction.guild, f"{interaction.user.mention} changed {member.mention} to `{date} {hour} UTC`")
     await interaction.response.send_message(f"✅ Updated {cursor.rowcount} member(s).", ephemeral=True)
 
@@ -577,7 +1127,8 @@ async def officer_remove_command(interaction: discord.Interaction, member: disco
         await db.commit()
 
     await compress_queue(interaction.guild.id)
-    await refresh_panel(interaction.guild)
+    await refresh_queue_panel(interaction.guild)
+    await refresh_officer_panel(interaction.guild)
     await log_action(interaction.guild, f"{interaction.user.mention} removed {member.mention} from the queue")
     await interaction.response.send_message(f"✅ Removed {cursor.rowcount} member(s).", ephemeral=True)
 
@@ -704,6 +1255,7 @@ async def on_ready():
 
     try:
         bot.add_view(CartView())
+        bot.add_view(BackupView())
         print("Persistent views loaded.")
     except Exception:
         traceback.print_exc()
@@ -713,6 +1265,18 @@ async def on_ready():
         print(f"Synced {len(synced)} commands.")
     except Exception:
         traceback.print_exc()
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute("SELECT guild_id FROM guild_settings")
+        guild_ids = [row[0] for row in await cursor.fetchall()]
+
+    for guild_id in guild_ids:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            try:
+                await refresh_all_panels(guild)
+            except Exception:
+                traceback.print_exc()
 
     if not reminder_task.is_running():
         reminder_task.start()
