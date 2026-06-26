@@ -30,6 +30,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 CART_HOURS = [f"{hour:02d}:00" for hour in range(24)]
 BACKUP_KEEP_LAST = 30
+CALENDAR_DAYS = 30
 
 MAINTENANCE_TIMES = [
     time(hour=hour, minute=minute, tzinfo=timezone.utc)
@@ -207,6 +208,60 @@ async def get_user(guild_id: int, user_id: int):
             (guild_id, user_id)
         )
         return await cursor.fetchone()
+
+
+async def date_is_available(guild_id: int, cart_date: str, ignore_user_id: int | None = None):
+    async with aiosqlite.connect(DB) as db:
+        if ignore_user_id is None:
+            cursor = await db.execute(
+                """
+                SELECT user_id
+                FROM carts
+                WHERE guild_id=? AND cart_date=?
+                LIMIT 1
+                """,
+                (guild_id, cart_date)
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT user_id
+                FROM carts
+                WHERE guild_id=? AND cart_date=? AND user_id!=?
+                LIMIT 1
+                """,
+                (guild_id, cart_date, ignore_user_id)
+            )
+
+        return await cursor.fetchone() is None
+
+
+async def get_available_cart_dates(guild_id: int, days: int = CALENDAR_DAYS):
+    start = today_utc()
+    dates = [start + timedelta(days=offset) for offset in range(days)]
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            """
+            SELECT cart_date
+            FROM carts
+            WHERE guild_id=?
+              AND date(cart_date) >= date(?)
+              AND date(cart_date) < date(?)
+            """,
+            (
+                guild_id,
+                start.isoformat(),
+                (start + timedelta(days=days)).isoformat(),
+            )
+        )
+        taken = {row[0] for row in await cursor.fetchall()}
+
+    return [date_obj for date_obj in dates if date_obj.isoformat() not in taken]
+
+
+def format_cart_date_label(date_obj):
+    return date_obj.strftime("%Y-%m-%d (%a)")
 
 
 async def compress_queue(guild_id: int):
@@ -568,7 +623,7 @@ async def refresh_officer_panel(guild: discord.Guild):
         settings,
         "officer_message_id",
         embed,
-        OfficerPanelView(members),
+        OfficerPanelView(),
     )
 
 
@@ -579,8 +634,57 @@ async def refresh_all_panels(guild: discord.Guild):
 
 # ================= USER VIEWS =================
 
+class JoinDateSelect(discord.ui.Select):
+    def __init__(self, dates, label_prefix: str):
+        options = [
+            discord.SelectOption(
+                label=format_cart_date_label(date_obj),
+                value=date_obj.isoformat(),
+            )
+            for date_obj in dates
+        ]
+
+        super().__init__(
+            placeholder=f"Select cart date ({label_prefix})",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cart_date = self.values[0]
+
+        if not await date_is_available(interaction.guild.id, cart_date):
+            return await interaction.response.send_message(
+                "❌ This date is already taken. Choose another date.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            f"📅 Selected date: **{cart_date}**\n\nNow choose a cart hour:",
+            view=JoinHourView(cart_date),
+            ephemeral=True,
+        )
+
+
+class JoinDateView(discord.ui.View):
+    def __init__(self, available_dates):
+        super().__init__(timeout=60)
+
+        first_half = available_dates[:15]
+        second_half = available_dates[15:30]
+
+        if first_half:
+            self.add_item(JoinDateSelect(first_half, "first half of month"))
+
+        if second_half:
+            self.add_item(JoinDateSelect(second_half, "second half of month"))
+
+
 class JoinHourSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, cart_date: str):
+        self.cart_date = cart_date
+
         options = [discord.SelectOption(label=f"{hour} UTC", value=hour) for hour in CART_HOURS]
         super().__init__(placeholder="Choose a cart hour", options=options)
 
@@ -601,10 +705,17 @@ class JoinHourSelect(discord.ui.Select):
                 ephemeral=True
             )
 
+        cart_date = self.cart_date
+        hour = self.values[0]
+
+        if not await date_is_available(guild.id, cart_date):
+            return await interaction.response.send_message(
+                "❌ This date is already taken. Choose another date.",
+                ephemeral=True
+            )
+
         rows = await get_queue(guild.id)
         position = len(rows) + 1
-        cart_date = default_cart_date(position)
-        hour = self.values[0]
 
         async with aiosqlite.connect(DB) as db:
             await db.execute(
@@ -627,9 +738,9 @@ class JoinHourSelect(discord.ui.Select):
 
 
 class JoinHourView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, cart_date: str):
         super().__init__(timeout=60)
-        self.add_item(JoinHourSelect())
+        self.add_item(JoinHourSelect(cart_date))
 
 
 class EditHourSelect(discord.ui.Select):
@@ -663,13 +774,71 @@ class EditHourView(discord.ui.View):
         self.add_item(EditHourSelect())
 
 
+
+
+async def send_join_date_picker(interaction: discord.Interaction):
+    guild = interaction.guild
+    settings = await get_settings(guild.id)
+
+    if not settings:
+        return await interaction.response.send_message(
+            "This server is not set up yet. An admin must use `/cart setup` first.",
+            ephemeral=True,
+        )
+
+    existing = await get_user(guild.id, interaction.user.id)
+    if existing:
+        return await interaction.response.send_message(
+            "⚠️ You are already in the queue.",
+            ephemeral=True,
+        )
+
+    available_dates = await get_available_cart_dates(guild.id)
+
+    if not available_dates:
+        return await interaction.response.send_message(
+            f"❌ No available cart dates in the next {CALENDAR_DAYS} days.",
+            ephemeral=True,
+        )
+
+    available_set = {date_obj.isoformat() for date_obj in available_dates}
+    start = today_utc()
+    calendar_lines = []
+
+    for offset in range(CALENDAR_DAYS):
+        date_obj = start + timedelta(days=offset)
+        status = "✅" if date_obj.isoformat() in available_set else "❌"
+        calendar_lines.append(f"{status} {format_cart_date_label(date_obj)}")
+
+    embed = discord.Embed(
+        title="📅 Choose Cart Date",
+        description=(
+            f"Select an available date from today through the next {CALENDAR_DAYS} days.\n"
+            "Only one cart can be scheduled per date. Taken dates are marked with ❌ below."
+        ),
+        colour=discord.Colour.green(),
+    )
+
+    embed.add_field(
+        name="Month calendar",
+        value="\n".join(calendar_lines),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=JoinDateView(available_dates),
+        ephemeral=True,
+    )
+
+
 class CartView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Join Queue", emoji="➕", style=discord.ButtonStyle.green, custom_id="public_join_queue")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Choose a cart hour:", view=JoinHourView(), ephemeral=True)
+        await send_join_date_picker(interaction)
 
     @discord.ui.button(label="Edit Hour", emoji="✏️", style=discord.ButtonStyle.blurple, custom_id="public_edit_hour")
     async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -800,6 +969,12 @@ class ManualAddModal(discord.ui.Modal, title="Add Name Manually"):
         if not valid_hour(hour_value):
             return await interaction.response.send_message("Invalid hour. Use format like 18:00.", ephemeral=True)
 
+        if not await date_is_available(interaction.guild.id, date_value):
+            return await interaction.response.send_message(
+                "❌ This date is already taken. Choose another date.",
+                ephemeral=True,
+            )
+
         rows = await get_queue(interaction.guild.id)
         position = len(rows) + 1
         manual_id = -int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -894,6 +1069,12 @@ class OfficerSearchModal(discord.ui.Modal):
                 return await interaction.response.send_message("Invalid hour. Use HH:00, example 18:00.", ephemeral=True)
 
         if self.action == "add":
+            if not await date_is_available(interaction.guild.id, date_value):
+                return await interaction.response.send_message(
+                    "❌ This date is already taken. Choose another date.",
+                    ephemeral=True,
+                )
+
             rows = await get_queue(interaction.guild.id)
             position = len(rows) + 1
 
@@ -914,6 +1095,12 @@ class OfficerSearchModal(discord.ui.Modal):
             return await interaction.response.send_message(f"✅ Added {member_label} at {date_value} {hour_value} UTC.", ephemeral=True)
 
         if self.action == "edit_datetime":
+            if not await date_is_available(interaction.guild.id, date_value, ignore_user_id=member_id):
+                return await interaction.response.send_message(
+                    "❌ This date is already taken. Choose another date.",
+                    ephemeral=True,
+                )
+
             async with aiosqlite.connect(DB) as db:
                 cursor = await db.execute(
                     "UPDATE carts SET cart_date=?, hour=?, reminded=0 WHERE guild_id=? AND user_id=?",
@@ -1048,7 +1235,7 @@ async def panel_command(interaction: discord.Interaction):
 
 @cart.command(name="join", description="Join the cart queue")
 async def join_command(interaction: discord.Interaction):
-    await interaction.response.send_message("Choose a cart hour:", view=JoinHourView(), ephemeral=True)
+    await send_join_date_picker(interaction)
 
 
 @cart.command(name="edit", description="Change your cart hour")
@@ -1089,6 +1276,9 @@ async def officer_add_command(interaction: discord.Interaction, member: discord.
     if not valid_hour(hour):
         return await interaction.response.send_message("Invalid hour. Use HH:00, example 18:00.", ephemeral=True)
 
+    if not await date_is_available(interaction.guild.id, date):
+        return await interaction.response.send_message("❌ This date is already taken. Choose another date.", ephemeral=True)
+
     rows = await get_queue(interaction.guild.id)
     position = len(rows) + 1
 
@@ -1120,6 +1310,9 @@ async def manual_add_command(interaction: discord.Interaction, name: str, date: 
     if not valid_hour(hour):
         return await interaction.response.send_message("Invalid hour. Use HH:00, example 18:00.", ephemeral=True)
 
+    if not await date_is_available(interaction.guild.id, date):
+        return await interaction.response.send_message("❌ This date is already taken. Choose another date.", ephemeral=True)
+
     rows = await get_queue(interaction.guild.id)
     position = len(rows) + 1
     manual_id = -int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -1150,6 +1343,9 @@ async def officer_edit_command(interaction: discord.Interaction, member: discord
         return await interaction.response.send_message("Invalid date. Use YYYY-MM-DD.", ephemeral=True)
     if not valid_hour(hour):
         return await interaction.response.send_message("Invalid hour. Use HH:00, example 18:00.", ephemeral=True)
+
+    if not await date_is_available(interaction.guild.id, date, ignore_user_id=member.id):
+        return await interaction.response.send_message("❌ This date is already taken. Choose another date.", ephemeral=True)
 
     async with aiosqlite.connect(DB) as db:
         cursor = await db.execute(
