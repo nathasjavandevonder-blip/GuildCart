@@ -428,7 +428,7 @@ async def build_queue_embed(guild: discord.Guild):
     )
 
     if not rows:
-        embed.description = "Queue is empty."
+        embed.description = "No carts are currently scheduled.\n\nUse ➕ **Join Queue** to claim the next available cart."
         return embed
 
     lines = []
@@ -492,21 +492,9 @@ async def refresh_queue_panel(guild: discord.Guild):
 
 
 async def refresh_backup_panel(guild: discord.Guild):
-    settings = await get_settings(guild.id)
-    if not settings or not settings.get("cart_channel_id"):
-        return
-
-    channel = guild.get_channel(settings["cart_channel_id"])
-    if not channel:
-        return
-
-    embed = discord.Embed(
-        title="💾 Backup Panel",
-        description="💾 Backup this server queue\n♻️ Restore latest server backup",
-        colour=discord.Colour.blurple(),
-    )
-
-    await upsert_message(channel, settings, "backup_message_id", embed, BackupView())
+    # Backup controls are now included in the Officer Panel.
+    # This keeps the public bot cleaner by avoiding a separate Backup Panel message.
+    return
 
 
 async def get_all_members(guild: discord.Guild):
@@ -557,13 +545,22 @@ async def refresh_officer_panel(guild: discord.Guild):
     if not channel:
         return
 
+    members = await get_all_members(guild)
+
     embed = discord.Embed(
         title="⚜️ Officer Panel",
         description=(
-            "Use the buttons below. Each action opens a search field.\n"
-            "Type the first letters, full name, mention, or Discord ID."
+            "Manage the queue using the buttons below.\n\n"
+            "➕ Add member to queue\n"
+            "📝 Add manual entry\n"
+            "➖ Remove member\n"
+            "⬆️ Move member up\n"
+            "⬇️ Move member down\n"
+            "🗓 Edit date and hour\n"
+            "💾 Create backup\n"
+            "♻️ Restore backup"
         ),
-        colour=discord.Colour.red(),
+        colour=discord.Colour.gold(),
     )
 
     await upsert_message(
@@ -571,7 +568,7 @@ async def refresh_officer_panel(guild: discord.Guild):
         settings,
         "officer_message_id",
         embed,
-        OfficerPanelView(),
+        OfficerPanelView(members),
     )
 
 
@@ -968,18 +965,41 @@ class OfficerActionButton(discord.ui.Button):
         if self.action == "add_manual":
             return await interaction.response.send_modal(ManualAddModal())
 
+        if self.action == "backup":
+            backup_file = await create_guild_backup(interaction.guild.id)
+            await log_action(interaction.guild, f"{interaction.user.mention} created backup `{backup_file.name}`")
+            return await interaction.response.send_message(f"✅ Backup created: `{backup_file.name}`", ephemeral=True)
+
+        if self.action == "restore":
+            await create_guild_backup(interaction.guild.id)
+            latest = await restore_latest_guild_backup(interaction.guild.id)
+
+            if not latest:
+                return await interaction.response.send_message("No backups found.", ephemeral=True)
+
+            await refresh_queue_panel(interaction.guild)
+            await refresh_officer_panel(interaction.guild)
+            await log_action(interaction.guild, f"{interaction.user.mention} restored backup `{latest.name}`")
+            return await interaction.response.send_message(f"✅ Restored `{latest.name}`", ephemeral=True)
+
         return await interaction.response.send_modal(OfficerSearchModal(self.action))
 
 
 class OfficerPanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+        # Row 1: queue management
         self.add_item(OfficerActionButton("➕ Add", "add", discord.ButtonStyle.green))
-        self.add_item(OfficerActionButton("📝 Add Manual", "add_manual", discord.ButtonStyle.green))
+        self.add_item(OfficerActionButton("📝 Manual", "add_manual", discord.ButtonStyle.green))
         self.add_item(OfficerActionButton("➖ Remove", "remove", discord.ButtonStyle.red))
         self.add_item(OfficerActionButton("⬆️ Up", "up", discord.ButtonStyle.secondary))
         self.add_item(OfficerActionButton("⬇️ Down", "down", discord.ButtonStyle.secondary))
-        self.add_item(OfficerActionButton("🗓 Edit", "edit_datetime", discord.ButtonStyle.blurple))
+
+        # Row 2: edit + backups
+        self.add_item(OfficerActionButton("🗓 Edit Date/Hour", "edit_datetime", discord.ButtonStyle.blurple))
+        self.add_item(OfficerActionButton("💾 Backup", "backup", discord.ButtonStyle.green))
+        self.add_item(OfficerActionButton("♻️ Restore", "restore", discord.ButtonStyle.blurple))
 # ================= COMMAND GROUP =================
 
 cart = app_commands.Group(name="cart", description="Guild Cart commands")
@@ -1313,6 +1333,10 @@ async def update_utc_channels():
         if channel and channel.name != new_name:
             try:
                 await channel.edit(name=new_name)
+            except discord.Forbidden:
+                # Bot has no access or lacks Manage Channels for this UTC channel.
+                # Ignore to avoid log spam; fix by giving the bot Manage Channels or leaving utc_channel empty in /cart setup.
+                pass
             except Exception:
                 traceback.print_exc()
 
