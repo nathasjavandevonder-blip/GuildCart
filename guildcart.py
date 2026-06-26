@@ -557,13 +557,11 @@ async def refresh_officer_panel(guild: discord.Guild):
     if not channel:
         return
 
-    members = await get_all_members(guild)
-
     embed = discord.Embed(
         title="⚜️ Officer Panel",
         description=(
-            "Select one or more members.\n"
-            "Then choose Add, Remove, Move Up, Move Down, or Edit Date + Hour."
+            "Use the buttons below. Each action opens a search field.\n"
+            "Type the first letters, full name, mention, or Discord ID."
         ),
         colour=discord.Colour.red(),
     )
@@ -573,7 +571,7 @@ async def refresh_officer_panel(guild: discord.Guild):
         settings,
         "officer_message_id",
         embed,
-        OfficerPanelView(members),
+        OfficerPanelView(),
     )
 
 
