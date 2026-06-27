@@ -1785,19 +1785,29 @@ async def reminder_task():
                 role_ping = role.mention if role else ""
 
                 try:
-                    await channel.send(
+                    msg = await channel.send(
                         f"{role_ping}\n\n"
                         f"🔔 **Guild Cart Reminder**\n\n"
                         f"📅 {cart_date}\n"
                         f"🕒 {hour} UTC\n\n"
                         f"Current owner: {owner}\n\n"
                         f"Today's cart starts in 15 minutes!"
-                    )
+                        )
 
-                    await db.execute(
-                        "UPDATE carts SET reminded=1 WHERE guild_id=? AND user_id=?",
-                        (guild_id, uid)
-                    )
+    async def delete_reminder(message):
+        await asyncio.sleep(3600)  # 1 hour
+
+        try:
+            await message.delete()
+        except:
+            pass
+
+    asyncio.create_task(delete_reminder(msg))
+
+    await db.execute(
+        "UPDATE carts SET reminded=1 WHERE guild_id=? AND user_id=?",
+        (guild_id, uid)
+    )
                     await db.commit()
 
                 except Exception:
