@@ -458,9 +458,12 @@ async def create_guild_backup(guild_id: int):
     return backup_file
 
 
-async def restore_latest_guild_backup(guild_id: int):
+async def restore_latest_guild_backup(guild_id: int, exclude_file: Path | None = None):
     create_backup_folder()
     files = sorted(Path(BACKUP_FOLDER).glob(f"guild_{guild_id}_*.json"), reverse=True)
+
+    if exclude_file is not None:
+        files = [file for file in files if file.resolve() != exclude_file.resolve()]
 
     if not files:
         return None
@@ -876,11 +879,14 @@ class CartView(discord.ui.View):
     @discord.ui.button(label="Leave Queue", emoji="❌", style=discord.ButtonStyle.red, custom_id="public_leave_queue")
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with aiosqlite.connect(DB) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "DELETE FROM carts WHERE guild_id=? AND user_id=?",
                 (interaction.guild.id, interaction.user.id)
             )
             await db.commit()
+
+        if cursor.rowcount == 0:
+            return await interaction.response.send_message("You are not in the queue.", ephemeral=True)
 
         await compress_queue(interaction.guild.id)
         await refresh_queue_panel(interaction.guild)
@@ -910,8 +916,8 @@ class BackupView(discord.ui.View):
         if not has_admin_access(interaction.user, settings):
             return await interaction.response.send_message("No permission.", ephemeral=True)
 
-        await create_guild_backup(interaction.guild.id)
-        latest = await restore_latest_guild_backup(interaction.guild.id)
+        safety_backup = await create_guild_backup(interaction.guild.id)
+        latest = await restore_latest_guild_backup(interaction.guild.id, exclude_file=safety_backup)
 
         if not latest:
             return await interaction.response.send_message("No backups found.", ephemeral=True)
@@ -1159,13 +1165,19 @@ class OfficerHourSelect(discord.ui.Select):
             )
 
         if self.action == "add":
+            if await get_user(interaction.guild.id, self.member_id):
+                return await interaction.response.send_message(
+                    f"⚠️ {self.member_label} is already in the queue.",
+                    ephemeral=True,
+                )
+
             rows = await get_queue(interaction.guild.id)
             position = len(rows) + 1
 
             async with aiosqlite.connect(DB) as db:
                 await db.execute(
                     """
-                    INSERT OR REPLACE INTO carts(guild_id, user_id, position, hour, cart_date, manual_name, reminded)
+                    INSERT INTO carts(guild_id, user_id, position, hour, cart_date, manual_name, reminded)
                     VALUES(?,?,?,?,?,?,0)
                     """,
                     (interaction.guild.id, self.member_id, position, hour_value, date_value, None)
@@ -1453,8 +1465,8 @@ class OfficerActionButton(discord.ui.Button):
             return await interaction.response.send_message(f"✅ Backup created: `{backup_file.name}`", ephemeral=True)
 
         if self.action == "restore":
-            await create_guild_backup(interaction.guild.id)
-            latest = await restore_latest_guild_backup(interaction.guild.id)
+            safety_backup = await create_guild_backup(interaction.guild.id)
+            latest = await restore_latest_guild_backup(interaction.guild.id, exclude_file=safety_backup)
 
             if not latest:
                 return await interaction.response.send_message("No backups found.", ephemeral=True)
@@ -1544,15 +1556,19 @@ async def edit_command(interaction: discord.Interaction):
 @cart.command(name="leave", description="Leave the cart queue")
 async def leave_command(interaction: discord.Interaction):
     async with aiosqlite.connect(DB) as db:
-        await db.execute(
+        cursor = await db.execute(
             "DELETE FROM carts WHERE guild_id=? AND user_id=?",
             (interaction.guild.id, interaction.user.id)
         )
         await db.commit()
 
+    if cursor.rowcount == 0:
+        return await interaction.response.send_message("You are not in the queue.", ephemeral=True)
+
     await compress_queue(interaction.guild.id)
     await refresh_queue_panel(interaction.guild)
     await refresh_officer_panel(interaction.guild)
+    await log_action(interaction.guild, f"{interaction.user.mention} left the queue")
     await interaction.response.send_message("❌ Removed from queue.", ephemeral=True)
 
 
@@ -1575,13 +1591,16 @@ async def officer_add_command(interaction: discord.Interaction, member: discord.
     if not await date_is_available(interaction.guild.id, date):
         return await interaction.response.send_message("❌ This date is already taken. Choose another date.", ephemeral=True)
 
+    if await get_user(interaction.guild.id, member.id):
+        return await interaction.response.send_message(f"⚠️ {member.mention} is already in the queue.", ephemeral=True)
+
     rows = await get_queue(interaction.guild.id)
     position = len(rows) + 1
 
     async with aiosqlite.connect(DB) as db:
         await db.execute(
             """
-            INSERT OR REPLACE INTO carts(guild_id, user_id, position, hour, cart_date, manual_name, reminded)
+            INSERT INTO carts(guild_id, user_id, position, hour, cart_date, manual_name, reminded)
             VALUES(?,?,?,?,?,?,0)
             """,
             (interaction.guild.id, member.id, position, hour, date, None)
@@ -1738,80 +1757,84 @@ async def nightly_backup_task():
 
 @tasks.loop(minutes=1)
 async def reminder_task():
-    await cleanup_expired_carts()
-    now = datetime.now(timezone.utc)
-    current_time = now.strftime("%H:%M")
-    today = today_utc().isoformat()
+    try:
+        await cleanup_expired_carts()
+        now = datetime.now(timezone.utc)
+        current_time = now.strftime("%H:%M")
+        today = today_utc().isoformat()
 
-    async with aiosqlite.connect(DB) as db:
-        settings_cursor = await db.execute(
-            "SELECT guild_id, cart_channel_id, cart_role_id FROM guild_settings"
-        )
-        all_settings = await settings_cursor.fetchall()
-
-        if current_time == "00:00":
-            await db.execute("UPDATE carts SET reminded=0")
-            await db.commit()
-
-        for guild_id, cart_channel_id, cart_role_id in all_settings:
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                continue
-
-            channel = guild.get_channel(cart_channel_id)
-            if not channel:
-                continue
-
-            role = guild.get_role(cart_role_id) if cart_role_id else None
-
-            cursor = await db.execute(
-                """
-                SELECT user_id, hour, manual_name, cart_date, reminded
-                FROM carts
-                WHERE guild_id=? AND cart_date=?
-                """,
-                (guild_id, today)
+        async with aiosqlite.connect(DB) as db:
+            settings_cursor = await db.execute(
+                "SELECT guild_id, cart_channel_id, cart_role_id FROM guild_settings"
             )
-            rows = await cursor.fetchall()
+            all_settings = await settings_cursor.fetchall()
 
-            for uid, hour, manual_name, cart_date, reminded in rows:
-                hour_dt = datetime.strptime(hour, "%H:%M")
-                reminder_time = (hour_dt - timedelta(minutes=15)).strftime("%H:%M")
+            # Reset the reminder flags at the start of a new UTC day.
+            if current_time == "00:00":
+                await db.execute("UPDATE carts SET reminded=0")
+                await db.commit()
 
-                if reminder_time != current_time or reminded:
+            for guild_id, cart_channel_id, cart_role_id in all_settings:
+                guild = bot.get_guild(guild_id)
+                if not guild:
                     continue
 
-                owner = f"**{manual_name}**" if manual_name else f"<@{uid}>"
-                role_ping = role.mention if role else ""
+                channel = guild.get_channel(cart_channel_id)
+                if not channel:
+                    continue
 
-                try:
-                    msg = await channel.send(
-                        f"{role_ping}\n\n"
-                        f"🔔 **Guild Cart Reminder**\n\n"
-                        f"📅 {cart_date}\n"
-                        f"🕒 {hour} UTC\n\n"
-                        f"Current owner: {owner}\n\n"
-                        f"Today's cart starts in 15 minutes!"
+                role = guild.get_role(cart_role_id) if cart_role_id else None
+
+                cursor = await db.execute(
+                    """
+                    SELECT user_id, hour, manual_name, cart_date, reminded
+                    FROM carts
+                    WHERE guild_id=? AND cart_date=?
+                    """,
+                    (guild_id, today)
+                )
+                rows = await cursor.fetchall()
+
+                for uid, hour, manual_name, cart_date, reminded in rows:
+                    try:
+                        hour_dt = datetime.strptime(hour, "%H:%M")
+                        reminder_time = (hour_dt - timedelta(minutes=15)).strftime("%H:%M")
+
+                        if reminder_time != current_time or reminded:
+                            continue
+
+                        owner = f"**{manual_name}**" if manual_name else f"<@{uid}>"
+                        role_ping = role.mention if role else ""
+
+                        msg = await channel.send(
+                            f"{role_ping}\n\n"
+                            f"🔔 **Guild Cart Reminder**\n\n"
+                            f"📅 {cart_date}\n"
+                            f"🕒 {hour} UTC\n\n"
+                            f"Current owner: {owner}\n\n"
+                            f"Today's cart starts in 15 minutes!"
                         )
 
-    async def delete_reminder(message):
-        await asyncio.sleep(3600)  # 1 hour
+                        async def delete_reminder(message):
+                            await asyncio.sleep(3600)  # 1 hour
+                            try:
+                                await message.delete()
+                            except Exception:
+                                pass
 
-        try:
-            await message.delete()
-        except:
-            pass
+                        asyncio.create_task(delete_reminder(msg))
 
-    asyncio.create_task(delete_reminder(msg))
+                        await db.execute(
+                            "UPDATE carts SET reminded=1 WHERE guild_id=? AND user_id=?",
+                            (guild_id, uid)
+                        )
+                        await db.commit()
 
-    await db.execute(
-        "UPDATE carts SET reminded=1 WHERE guild_id=? AND user_id=?",
-        (guild_id, uid)
-    )
-                    await db.commit()
+                    except Exception:
+                        traceback.print_exc()
 
-                except Exception:
-                    traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
 
 
 @tasks.loop(minutes=1)
