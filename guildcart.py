@@ -1714,6 +1714,19 @@ async def settings_command(interaction: discord.Interaction):
 
 bot.tree.add_command(cart)
 
+
+
+async def delete_reminder(message: discord.Message):
+    await asyncio.sleep(3600)  # 1 hour
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
+
 # ================= TASKS =================
 
 @tasks.loop(time=MAINTENANCE_TIMES)
@@ -1814,13 +1827,6 @@ async def reminder_task():
                             f"Current owner: {owner}\n\n"
                             f"Today's cart starts in 15 minutes!"
                         )
-
-                        async def delete_reminder(message):
-                            await asyncio.sleep(3600)  # 1 hour
-                            try:
-                                await message.delete()
-                            except Exception:
-                                pass
 
                         asyncio.create_task(delete_reminder(msg))
 
